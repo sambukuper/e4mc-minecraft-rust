@@ -238,6 +238,7 @@ build_from_source() {
     if [ -d "$LauncherDir/crates/horizon-e4mc" ]; then
         echo "crates/horizon-e4mc already exists: the port is in, nothing to apply."
     else
+        if [ -z "$PatchPath" ]; then
             PatchPath=$(mktemp)
             echo "Downloading the port patch..."
             curl -fsSL "$PatchUrl" -o "$PatchPath" ||
