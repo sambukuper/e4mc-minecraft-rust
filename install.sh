@@ -238,10 +238,6 @@ build_from_source() {
     if [ -d "$LauncherDir/crates/horizon-e4mc" ]; then
         echo "crates/horizon-e4mc already exists: the port is in, nothing to apply."
     else
-        if [ ! -d "$LauncherDir/crates/horizon-steam" ]; then
-            fail "this checkout has no Steam port (crates/horizon-steam); e4mc's integration builds on it. Clone $LauncherRepo (or pull its main) and try again."
-        fi
-        if [ -z "$PatchPath" ]; then
             PatchPath=$(mktemp)
             echo "Downloading the port patch..."
             curl -fsSL "$PatchUrl" -o "$PatchPath" ||
@@ -348,7 +344,7 @@ else
                 cp -p "$target" "$target.upstream"
             fi
             install -m 0755 "$GameBinary" "$target"
-            # The mod's companions (a Steam API library on Windows; nothing on Linux so far).
+            # The mod's companions (none today; the launcher copies whatever sits beside the build).
             for file in "$ModDir"/*; do
                 [ -f "$file" ] || continue
                 name=$(basename "$file")

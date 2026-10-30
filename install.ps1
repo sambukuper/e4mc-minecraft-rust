@@ -5,9 +5,9 @@
 # launcher's game versions:
 #   1. finds an elyhorizon-launcher clone (or clones sambukuper's fork),
 #   2. applies the port with `git am` (skipped when it is already in),
-#   3. builds horizon-client with the `mods` and `steam` features,
-#   4. puts the Steamworks redistributable (steam_api64.dll) beside the game,
-#   5. installs the built game as the launcher's game-mod build: every
+#   3. builds horizon-client with the `mods` feature (no Steam: e4mc needs
+#      no Steam library),
+#   4. installs the built game as the launcher's game-mod build: every
 #      installed version, new ones included, plays it (the launcher swaps
 #      it in at launch; each version's own binary is kept as .upstream).
 #
@@ -17,9 +17,7 @@
 #
 # Requirements: git, Rust 1.90+ (rustup), Windows x64. The game needs its
 # resources prepared from your own copy of Minecraft (the launcher's Play
-# page does that). e4mc itself needs no Steam and no port forwarding; the
-# `steam` feature is built in only because the port ships beside the
-# e4steam one in the same fork.
+# page does that). e4mc itself needs no Steam and no port forwarding.
 param(
     # An existing elyhorizon-launcher checkout. Default: one next to the
     # current directory, or a fresh clone of the fork made here.
@@ -72,9 +70,6 @@ Step "integrating the port"
 if (Test-Path "$LauncherDir\crates\horizon-e4mc") {
     Write-Host "crates\horizon-e4mc already exists: the port is in, nothing to apply."
 } else {
-    if (-not (Test-Path "$LauncherDir\crates\horizon-steam")) {
-        Fail "this checkout has no Steam port (crates\horizon-steam); e4mc's integration builds on it. Clone $LauncherRepo (or pull its main) and try again, or install the Steam port first: https://github.com/sambukuper/e4steam-rust"
-    }
     if ($PatchPath) {
         if (-not (Test-Path $PatchPath)) { Fail "patch file not found: $PatchPath" }
         $patch = (Resolve-Path $PatchPath).Path
@@ -106,14 +101,14 @@ if ($SkipBuild) {
     Step "skipping the build (-SkipBuild)"
     Write-Host "Build later with:"
     Write-Host "  cd `"$LauncherDir`""
-    Write-Host "  cargo build --release -p horizon-client --features mods,steam"
+    Write-Host "  cargo build --release -p horizon-client --features mods"
     exit 0
 }
 
 Step "building the game (cargo release; half an hour on a laptop)"
 Push-Location $LauncherDir
 try {
-    cargo build --release -p horizon-client --features mods,steam
+    cargo build --release -p horizon-client --features mods
     if ($LASTEXITCODE -ne 0) {
         Fail "cargo build failed. Rust 1.90+ is required: https://rustup.rs then try again."
     }
@@ -122,16 +117,6 @@ try {
 }
 $GameExe = "$LauncherDir\target\release\horizon-client.exe"
 if (-not (Test-Path $GameExe)) { Fail "the build finished but horizon-client.exe isn't at $GameExe." }
-
-Step "placing the Steamworks redistributable"
-# The `steam` feature links steam_api64.dll; the loader wants it beside
-# the game. The steamworks-sys crate ships it inside its own package.
-$Dll = Get-ChildItem -ErrorAction SilentlyContinue `
-    "$env:USERPROFILE\.cargo\registry\src\*\steamworks-sys-*\lib\steam\redistributable_bin\win64\steam_api64.dll" |
-    Select-Object -First 1
-if (-not $Dll) { Fail "steam_api64.dll wasn't found in the cargo registry; build once more, or copy it from the steamworks-sys crate's lib\steam\redistributable_bin\win64." }
-Copy-Item $Dll.FullName "$LauncherDir\target\release\steam_api64.dll" -Force
-Write-Host "Copied $($Dll.Name) beside the game."
 
 if ($NoGameMod) {
     Step "skipping the game-mod install (-NoGameMod)"
@@ -143,7 +128,6 @@ if ($NoGameMod) {
     $ModDir = Join-Path $DataDir "game-mod"
     New-Item -ItemType Directory -Force -Path $ModDir | Out-Null
     Copy-Item $GameExe (Join-Path $ModDir "horizon-client.exe") -Force
-    Copy-Item "$LauncherDir\target\release\steam_api64.dll" (Join-Path $ModDir "steam_api64.dll") -Force
     # Which game the build is for; the launcher checks it before swapping in.
     "26.3" | Set-Content (Join-Path $ModDir "game-version.txt")
     Write-Host "Kept in $ModDir"
@@ -158,7 +142,6 @@ if ($NoGameMod) {
                 Copy-Item $Exe "$Exe.upstream" -Force
             }
             Copy-Item $GameExe $Exe -Force
-            Copy-Item $Dll.FullName (Join-Path $_.FullName "steam_api64.dll") -Force
         }
         Write-Host "Every installed version plays it now."
     } else {
