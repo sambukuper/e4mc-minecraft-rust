@@ -1,0 +1,2263 @@
+From 011a0ae2b60248670377606074cb14593d222b4e Mon Sep 17 00:00:00 2001
+From: sambukuper <sambukuper@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 01:44:39 +0300
+Subject: [PATCH 1/4] Publish the world to anyone: e4mc ported
+
+e4mc opens a LAN server to anyone, anywhere, anytime; Java mods do not
+run on Horizon, so what the mod does arrives natively. The host connects
+out to e4mc's public quiclime relay over QUIC, the relay assigns the
+world a public domain, and every guest who joins the domain becomes one
+bidirectional stream on the session, bridged byte for byte to the
+integrated server's LAN port - the same shape as the Steam share and the
+invite code, with a third transport in front of the same LAN port. The
+address creates itself: no Steam, no port forwarding, no invitation, and
+guests join from any client, vanilla's included.
+
+crates/horizon-e4mc: the broker call, the control channel (varint-framed
+JSON like the Java mod's codec), the guest bridges and the session
+lifecycle on a private tokio runtime. The endpoint outlives the session
+on purpose: dropping it kills connections silently, and the close frame
+is what tells the relay to end its guests. Guest counters ride an RAII
+guard, so a cancelled bridge still reports itself gone.
+
+The Play with Friends screen gains the Anyone (e4mc) section: Publish to
+Anyone, the green address with a copy button, Stop Publishing. The three
+shares hand the LAN port over to each other instead of closing it under
+the others' guests; the screen says the address is public before the
+button does anything.
+
+Tests: the codec and facade unit-tested; one --ignored test runs the
+whole chain live against e4mc's public broker and relay - domain
+assigned, a guest joining with a real Minecraft handshake, bytes both
+ways, stop dropping the guest. It passed.
+
+Co-Authored-By: ZCode (GLM-5.3-Flash) <noreply@z.ai>
+---
+ Cargo.lock                                    | 187 ++++++++++-
+ Cargo.toml                                    |   1 +
+ crates/horizon-client/Cargo.toml              |   3 +
+ crates/horizon-client/src/friends_screen.rs   |  84 +++++
+ crates/horizon-client/src/game.rs             |   6 +
+ .../horizon-client/src/game/e4mc_friends.rs   | 105 ++++++
+ crates/horizon-client/src/game/friends.rs     | 130 +++++++-
+ crates/horizon-e4mc/Cargo.toml                |  26 ++
+ crates/horizon-e4mc/src/control.rs            | 215 ++++++++++++
+ crates/horizon-e4mc/src/lib.rs                | 310 ++++++++++++++++++
+ crates/horizon-e4mc/src/session.rs            | 294 +++++++++++++++++
+ docs/README.md                                |   1 +
+ docs/e4mc.md                                  |  62 ++++
+ docs/play-with-friends.md                     |   4 +-
+ 14 files changed, 1414 insertions(+), 14 deletions(-)
+ create mode 100644 crates/horizon-client/src/game/e4mc_friends.rs
+ create mode 100644 crates/horizon-e4mc/Cargo.toml
+ create mode 100644 crates/horizon-e4mc/src/control.rs
+ create mode 100644 crates/horizon-e4mc/src/lib.rs
+ create mode 100644 crates/horizon-e4mc/src/session.rs
+ create mode 100644 docs/e4mc.md
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 387bba5ba..c88259cb1 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -384,7 +384,18 @@ checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
+ dependencies = [
+  "cfg-if",
+  "cipher",
+- "cpufeatures",
++ "cpufeatures 0.2.17",
++]
++
++[[package]]
++name = "chacha20"
++version = "0.10.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
++dependencies = [
++ "cfg-if",
++ "cpufeatures 0.3.1",
++ "rand_core 0.10.1",
+ ]
+ 
+ [[package]]
+@@ -394,7 +405,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
+ dependencies = [
+  "aead",
+- "chacha20",
++ "chacha20 0.9.1",
+  "cipher",
+  "poly1305",
+  "zeroize",
+@@ -581,6 +592,15 @@ dependencies = [
+  "libc",
+ ]
+ 
++[[package]]
++name = "cpufeatures"
++version = "0.3.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
++dependencies = [
++ "libc",
++]
++
+ [[package]]
+ name = "cranelift-assembler-x64"
+ version = "0.135.7"
+@@ -755,7 +775,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
+ dependencies = [
+  "generic-array",
+- "rand_core",
++ "rand_core 0.6.4",
+  "typenum",
+ ]
+ 
+@@ -772,10 +792,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "97fb8b7c4503de7d6ae7b42ab72a5a59857b4c937ec27a3d4539dba95b5ab2be"
+ dependencies = [
+  "cfg-if",
+- "cpufeatures",
++ "cpufeatures 0.2.17",
+  "curve25519-dalek-derive",
+  "fiat-crypto",
+- "rand_core",
++ "rand_core 0.6.4",
+  "rustc_version",
+  "subtle",
+ ]
+@@ -1127,8 +1147,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
+ dependencies = [
+  "cfg-if",
++ "js-sys",
+  "libc",
+  "wasi",
++ "wasm-bindgen",
+ ]
+ 
+ [[package]]
+@@ -1150,8 +1172,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
+ dependencies = [
+  "cfg-if",
++ "js-sys",
+  "libc",
+  "r-efi 6.0.0",
++ "rand_core 0.10.1",
++ "wasm-bindgen",
+ ]
+ 
+ [[package]]
+@@ -1383,6 +1408,7 @@ dependencies = [
+  "horizon-command",
+  "horizon-core",
+  "horizon-dualsense",
++ "horizon-e4mc",
+  "horizon-friends",
+  "horizon-hdr",
+  "horizon-items",
+@@ -1460,6 +1486,21 @@ dependencies = [
+  "log",
+ ]
+ 
++[[package]]
++name = "horizon-e4mc"
++version = "0.1.0"
++dependencies = [
++ "anyhow",
++ "log",
++ "quinn",
++ "rustls",
++ "serde",
++ "serde_json",
++ "tokio",
++ "ureq",
++ "webpki-roots 0.26.11",
++]
++
+ [[package]]
+ name = "horizon-friends"
+ version = "0.1.0"
+@@ -2116,6 +2157,12 @@ version = "0.4.34"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+ 
++[[package]]
++name = "lru-slab"
++version = "0.1.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
++
+ [[package]]
+ name = "lz4_flex"
+ version = "0.14.0"
+@@ -2194,6 +2241,17 @@ dependencies = [
+  "simd-adler32",
+ ]
+ 
++[[package]]
++name = "mio"
++version = "1.2.4"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
++dependencies = [
++ "libc",
++ "wasi",
++ "windows-sys 0.61.2",
++]
++
+ [[package]]
+ name = "multiversion_no_op"
+ version = "1.0.0"
+@@ -2862,7 +2920,7 @@ version = "0.8.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "8159bd90725d2df49889a078b54f4f79e87f1f8a8444194cdca81d38f5393abf"
+ dependencies = [
+- "cpufeatures",
++ "cpufeatures 0.2.17",
+  "opaque-debug",
+  "universal-hash",
+ ]
+@@ -2991,6 +3049,62 @@ dependencies = [
+  "memchr",
+ ]
+ 
++[[package]]
++name = "quinn"
++version = "0.11.12"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4051e23e9185c255a7e33ef59cdbca87a22d359052eecd22fc6b901fb37d9d11"
++dependencies = [
++ "bytes",
++ "cfg_aliases",
++ "pin-project-lite",
++ "quinn-proto",
++ "quinn-udp",
++ "rustc-hash 2.1.3",
++ "rustls",
++ "socket2 0.6.5",
++ "thiserror 2.0.21",
++ "tokio",
++ "tracing",
++ "web-time",
++]
++
++[[package]]
++name = "quinn-proto"
++version = "0.11.19"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe"
++dependencies = [
++ "bytes",
++ "getrandom 0.4.3",
++ "lru-slab",
++ "rand",
++ "rand_pcg",
++ "ring",
++ "rustc-hash 2.1.3",
++ "rustls",
++ "rustls-pki-types",
++ "slab",
++ "thiserror 2.0.21",
++ "tinyvec",
++ "tracing",
++ "web-time",
++]
++
++[[package]]
++name = "quinn-udp"
++version = "0.5.16"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016"
++dependencies = [
++ "cfg_aliases",
++ "libc",
++ "once_cell",
++ "socket2 0.6.5",
++ "tracing",
++ "windows-sys 0.61.2",
++]
++
+ [[package]]
+ name = "quote"
+ version = "1.0.47"
+@@ -3012,6 +3126,17 @@ version = "6.0.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+ 
++[[package]]
++name = "rand"
++version = "0.10.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
++dependencies = [
++ "chacha20 0.10.2",
++ "getrandom 0.4.3",
++ "rand_core 0.10.1",
++]
++
+ [[package]]
+ name = "rand_core"
+ version = "0.6.4"
+@@ -3021,6 +3146,21 @@ dependencies = [
+  "getrandom 0.2.17",
+ ]
+ 
++[[package]]
++name = "rand_core"
++version = "0.10.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
++
++[[package]]
++name = "rand_pcg"
++version = "0.10.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
++dependencies = [
++ "rand_core 0.10.1",
++]
++
+ [[package]]
+ name = "range-alloc"
+ version = "0.1.5"
+@@ -3217,6 +3357,7 @@ version = "1.15.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "2f4925028c7eb5d1fcdaf196971378ed9d2c1c4efc7dc5d011256f76c99c0a96"
+ dependencies = [
++ "web-time",
+  "zeroize",
+ ]
+ 
+@@ -3349,7 +3490,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
+ dependencies = [
+  "cfg-if",
+- "cpufeatures",
++ "cpufeatures 0.2.17",
+  "digest",
+ ]
+ 
+@@ -3360,7 +3501,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+ dependencies = [
+  "cfg-if",
+- "cpufeatures",
++ "cpufeatures 0.2.17",
+  "digest",
+ ]
+ 
+@@ -3478,7 +3619,7 @@ checksum = "c5482afe85a0b6ce956c945401598dbc527593c77ba51d0a87a586938b1b893a"
+ dependencies = [
+  "curve25519-dalek",
+  "hkdf",
+- "rand_core",
++ "rand_core 0.6.4",
+  "sha2",
+ ]
+ 
+@@ -3727,13 +3868,36 @@ dependencies = [
+  "zerovec",
+ ]
+ 
++[[package]]
++name = "tinyvec"
++version = "1.13.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
++
+ [[package]]
+ name = "tokio"
+ version = "1.53.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
+ dependencies = [
++ "bytes",
++ "libc",
++ "mio",
+  "pin-project-lite",
++ "socket2 0.6.5",
++ "tokio-macros",
++ "windows-sys 0.61.2",
++]
++
++[[package]]
++name = "tokio-macros"
++version = "2.7.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "78773a2a397f451582ce068015985c33193cf6dea8b74d2a639fe457b2f07b0e"
++dependencies = [
++ "proc-macro2",
++ "quote",
++ "syn 3.0.6",
+ ]
+ 
+ [[package]]
+@@ -3803,6 +3967,9 @@ name = "tracing-core"
+ version = "0.1.36"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
++dependencies = [
++ "once_cell",
++]
+ 
+ [[package]]
+ name = "tree_magic_mini"
+@@ -3890,6 +4057,8 @@ dependencies = [
+  "once_cell",
+  "rustls",
+  "rustls-pki-types",
++ "serde",
++ "serde_json",
+  "url",
+  "webpki-roots 0.26.11",
+ ]
+diff --git a/Cargo.toml b/Cargo.toml
+index b6394a9be..8a65ce845 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -23,6 +23,7 @@ members = [
+     "crates/horizon-friends",
+     "crates/horizon-relay",
+     "crates/horizon-steam",
++    "crates/horizon-e4mc",
+     "crates/horizon-mod-sdk",
+     "crates/horizon-mods",
+     "crates/horizon-mods/tests/guest",
+diff --git a/crates/horizon-client/Cargo.toml b/crates/horizon-client/Cargo.toml
+index ef7c35c94..42cac978f 100644
+--- a/crates/horizon-client/Cargo.toml
++++ b/crates/horizon-client/Cargo.toml
+@@ -30,6 +30,9 @@ horizon-friends = { path = "../horizon-friends" }
+ # The `steam` feature links the Steamworks SDK redistributable, so the game
+ # needs steam_api beside it; off in dev builds and tests.
+ horizon-steam = { path = "../horizon-steam", optional = true }
++# e4mc publishing: the world public on e4mc's relay (docs/e4mc.md); pure
++# Rust, always linked, idle until the player publishes.
++horizon-e4mc = { path = "../horizon-e4mc" }
+ # Horizon mods: sandboxed WebAssembly components, off unless installed and turned on (docs/mods.md).
+ # Their runtime is the `mods` feature.
+ horizon-mods = { path = "../horizon-mods", default-features = false, features = ["index"] }
+diff --git a/crates/horizon-client/src/friends_screen.rs b/crates/horizon-client/src/friends_screen.rs
+index c12a7cbb7..c05d7b90e 100644
+--- a/crates/horizon-client/src/friends_screen.rs
++++ b/crates/horizon-client/src/friends_screen.rs
+@@ -32,6 +32,24 @@ pub struct FriendsView {
+     pub copied: bool,
+     /// The Steam section (the e4steam port), when Steam sharing is offered.
+     pub steam: Option<SteamView>,
++    /// The e4mc section: the world public on the relay's domain.
++    pub e4mc: Option<E4mcView>,
++}
++
++/// The e4mc part of the screen: the world's public domain, joinable by
++/// anyone from any client.
++#[derive(Clone, Debug, Default)]
++pub struct E4mcView {
++    /// The world is published right now.
++    pub publishing: bool,
++    /// The world's public domain.
++    pub domain: Option<String>,
++    /// Guests being carried right now.
++    pub guests: usize,
++    /// Why publishing isn't serving, when the player asked for it.
++    pub problem: Option<String>,
++    /// The domain was just copied.
++    pub copied: bool,
+ }
+ 
+ /// The Steam part of the screen: the world open to a Steam lobby, joined
+@@ -63,6 +81,12 @@ pub enum Action {
+     SteamStop,
+     /// Open the Steam overlay's invite dialog.
+     SteamInvite,
++    /// Publish the world through e4mc's public relay.
++    E4mcPublish,
++    /// Copy the public domain.
++    E4mcCopy,
++    /// End the publish.
++    E4mcStop,
+     /// Open the troubleshooting page.
+     Help,
+     Done,
+@@ -243,6 +267,66 @@ fn layout(
+             });
+         }
+     }
++    // The e4mc section: the world's public domain, joinable by anyone.
++    if let Some(e4mc) = &view.e4mc
++        && y + 64.0 <= h - 33.0
++    {
++        y += 6.0;
++        lines.push(("Anyone (e4mc)".to_owned(), grey(), y));
++        y += 12.0;
++        if e4mc.publishing {
++            match &e4mc.domain {
++                Some(domain) => add(
++                    &mut lines,
++                    &format!(
++                        "Anyone with the address joins, even from vanilla Minecraft: {domain}"
++                    ),
++                    WHITE,
++                    &mut y,
++                ),
++                None => add(&mut lines, "Reaching the relay...", WHITE, &mut y),
++            }
++            buttons.push(Button {
++                x: cx - 154.0,
++                y,
++                w: 150.0,
++                label: if e4mc.copied {
++                    "Copied"
++                } else {
++                    "Copy Address"
++                },
++                action: Action::E4mcCopy,
++                active: e4mc.domain.is_some(),
++            });
++            buttons.push(Button {
++                x: cx + 4.0,
++                y,
++                w: 150.0,
++                label: "Stop Publishing",
++                action: Action::E4mcStop,
++                active: true,
++            });
++            y += 30.0;
++            if let Some(problem) = &e4mc.problem {
++                add(&mut lines, problem, WHITE, &mut y);
++            }
++        } else {
++            add(
++                &mut lines,
++                "Publish the world through e4mc's public relay: the address creates itself, and anyone who finds it joins, no Steam needed.",
++                WHITE,
++                &mut y,
++            );
++            buttons.push(Button {
++                x: cx - 100.0,
++                y,
++                w: 200.0,
++                label: "Publish to Anyone",
++                action: Action::E4mcPublish,
++                active: view.shown,
++            });
++        }
++    }
+     // HeaderAndFooterLayout's footer: Done, beside Troubleshooting when
+     // friends on the internet can't reach the host.
+     if view.sharing && view.help.is_some() {
+diff --git a/crates/horizon-client/src/game.rs b/crates/horizon-client/src/game.rs
+index eb06cbec1..f247bd10c 100644
+--- a/crates/horizon-client/src/game.rs
++++ b/crates/horizon-client/src/game.rs
+@@ -51,6 +51,7 @@ mod dispense_fixture;
+ mod dispenser;
+ mod dragon;
+ mod dynamic_lights;
++mod e4mc_friends;
+ mod enchant_effects;
+ mod end;
+ mod entity_culling;
+@@ -1850,6 +1851,9 @@ struct Game<'a> {
+     /// The open world is open to Steam friends (game/friends.rs, the e4steam
+     /// port over horizon-steam).
+     steam: Option<friends::SteamSharing>,
++    /// The open world is published through e4mc's public relay
++    /// (game/friends.rs, the e4mc port over horizon-e4mc).
++    e4mc: Option<friends::E4mcSharing>,
+     world_options: Option<lan_screen::WorldOptions>,
+     /// Chat Settings opened from RestrictionsScreen: Done returns to World Options.
+     options_to_world_options: bool,
+@@ -5486,6 +5490,7 @@ impl Game<'_> {
+         horizon_client::spans::time("tick_lan", || self.tick_lan(false));
+         self.tick_friends();
+         self.tick_steam();
++        self.tick_e4mc();
+         horizon_client::spans::time("tick_hand", || self.tick_hand());
+         horizon_client::spans::time("tick_sleep", || self.tick_sleep());
+         self.announce_sleep_status();
+@@ -13947,6 +13952,7 @@ impl<'a> Game<'a> {
+             command_block_screen: None,
+             friends: None,
+             steam: None,
++            e4mc: None,
+             debug_keys: Default::default(),
+             debug_charts: Default::default(),
+             show_hitboxes: false,
+diff --git a/crates/horizon-client/src/game/e4mc_friends.rs b/crates/horizon-client/src/game/e4mc_friends.rs
+new file mode 100644
+index 000000000..80409ea17
+--- /dev/null
++++ b/crates/horizon-client/src/game/e4mc_friends.rs
+@@ -0,0 +1,105 @@
++//! e4mc publishing: the open world published through e4mc's public relay
++//! ([horizon-e4mc]), the "Open to LAN as normal, the address creates
++//! itself" flow. Anyone with the domain joins, even from vanilla
++//! Minecraft; there is no identity and no invitation. The button says so.
++//!
++//! [horizon-e4mc]: ../../../horizon_e4mc/index.html
++
++/// What the Play with Friends screen shows about e4mc publishing.
++#[derive(Clone, Debug, Default)]
++pub struct View {
++    /// The world's public domain, once the relay assigned it.
++    pub domain: Option<String>,
++    /// Guests being carried right now.
++    pub guests: usize,
++    /// Why publishing isn't serving, when the player asked for it.
++    pub problem: Option<String>,
++}
++
++/// What a tick reports to the game.
++#[derive(Debug)]
++pub enum Event {
++    /// The world's public address is ready.
++    Published(String),
++    /// A note the relay asked every host to show its players.
++    Broadcast(String),
++    /// A guest's stream is being carried.
++    GuestJoined,
++    /// The guest's stream ended.
++    GuestLeft,
++}
++
++pub struct Sharing {
++    publish: Option<horizon_e4mc::Publish>,
++    copied: Option<std::time::Instant>,
++}
++
++impl Sharing {
++    /// Start publishing the world already open to LAN on `lan`.
++    pub fn start(lan: std::net::SocketAddr) -> Result<Sharing, String> {
++        Ok(Sharing {
++            publish: Some(horizon_e4mc::Publish::start(horizon_e4mc::PublishConfig {
++                lan,
++                relay: std::env::var("E4MC_RELAY").ok().and_then(|relay| {
++                    let (host, port) = relay.rsplit_once(':')?;
++                    Some((host.to_owned(), port.parse().ok()?))
++                }),
++            })?),
++            copied: None,
++        })
++    }
++
++    /// End the publish: the domain stops answering, guests are dropped.
++    pub fn stop(&mut self) {
++        if let Some(publish) = self.publish.take() {
++            publish.stop();
++        }
++    }
++
++    /// New guests, relay notes and the domain, once a tick.
++    pub fn tick(&mut self) -> Vec<Event> {
++        let Some(publish) = &self.publish else {
++            return Vec::new();
++        };
++        publish
++            .poll()
++            .into_iter()
++            .filter_map(|event| match event {
++                horizon_e4mc::PublishEvent::Published { domain } => Some(Event::Published(domain)),
++                horizon_e4mc::PublishEvent::Broadcast(message) => Some(Event::Broadcast(message)),
++                horizon_e4mc::PublishEvent::GuestJoined => Some(Event::GuestJoined),
++                horizon_e4mc::PublishEvent::GuestLeft => Some(Event::GuestLeft),
++                horizon_e4mc::PublishEvent::Problem(_) => None,
++            })
++            .collect()
++    }
++
++    /// What the screen shows.
++    pub fn view(&self) -> View {
++        match &self.publish {
++            Some(publish) => {
++                let state = publish.state();
++                View {
++                    domain: state.domain,
++                    guests: state.guests,
++                    problem: state.problem,
++                }
++            }
++            None => View::default(),
++        }
++    }
++
++    /// The public domain, for the copy button.
++    pub fn address(&self) -> Option<String> {
++        self.view().domain
++    }
++
++    /// The address was just copied (the button says so for a moment).
++    pub fn mark_copied(&mut self) {
++        self.copied = Some(std::time::Instant::now());
++    }
++    pub fn just_copied(&self) -> bool {
++        self.copied
++            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2))
++    }
++}
+diff --git a/crates/horizon-client/src/game/friends.rs b/crates/horizon-client/src/game/friends.rs
+index 02b14f40c..6be3b809c 100644
+--- a/crates/horizon-client/src/game/friends.rs
++++ b/crates/horizon-client/src/game/friends.rs
+@@ -6,7 +6,7 @@
+ //! configured adds a short code and a fallback. The integrated server is the
+ //! LAN one, unchanged: tunnelled guests are LAN guests that connect from the
+ //! loopback address.
+-use super::{Game, lan::LanSettings, steam_friends};
++use super::{Game, e4mc_friends, lan::LanSettings, steam_friends};
+ use horizon_client::{
+     Result,
+     friends_screen::{self, Action, FriendsView},
+@@ -38,6 +38,14 @@ pub(super) struct SteamSharing {
+     opened_lan: bool,
+ }
+ 
++/// e4mc publishing: the world public on the relay's domain, and whether
++/// publishing opened the world to LAN.
++pub(super) struct E4mcSharing {
++    inner: e4mc_friends::Sharing,
++    /// Publishing opened the world to LAN, so stopping closes it again.
++    opened_lan: bool,
++}
++
+ pub const HELP: &[&str] = &[
+     "friends host                   share the open world behind an invite code",
+     "friends stop                   stop sharing",
+@@ -127,7 +135,7 @@ impl Game<'_> {
+             return;
+         };
+         sharing.host.stop();
+-        if sharing.opened_lan && self.steam.is_none() {
++        if sharing.opened_lan && self.steam.is_none() && self.e4mc.is_none() {
+             self.lan_close(true);
+         } else {
+             self.system_message(Text::literal("Stopped sharing the invite code."));
+@@ -142,6 +150,9 @@ impl Game<'_> {
+         if let Some(mut sharing) = self.steam.take() {
+             sharing.inner.stop();
+         }
++        if let Some(mut sharing) = self.e4mc.take() {
++            sharing.inner.stop();
++        }
+     }
+ 
+     /// Open the world to Steam friends (the e4steam port): like
+@@ -154,7 +165,7 @@ impl Game<'_> {
+         if self.title.is_some() || (self.remote.is_some() && self.integrated.is_none()) {
+             return Err("open a singleplayer world first".into());
+         }
+-        let opened_lan = self.lan_port().is_none() && self.friends.is_none();
++        let opened_lan = self.lan_port().is_none() && self.friends.is_none() && self.e4mc.is_none();
+         if self.lan_port().is_none() {
+             self.lan_open(LanSettings {
+                 port: horizon_client::lan::available_port(),
+@@ -187,7 +198,7 @@ impl Game<'_> {
+             return;
+         };
+         sharing.inner.stop();
+-        if sharing.opened_lan && self.friends.is_none() {
++        if sharing.opened_lan && self.friends.is_none() && self.e4mc.is_none() {
+             self.lan_close(true);
+         } else {
+             self.system_message(Text::literal("Stopped sharing to Steam friends."));
+@@ -329,6 +340,13 @@ impl Game<'_> {
+             Action::SteamCopy => self.steam_copy(),
+             Action::SteamStop => self.steam_stop(),
+             Action::SteamInvite => self.steam_invite(),
++            Action::E4mcPublish => {
++                if let Err(e) = self.e4mc_start() {
++                    self.system_message(Text::literal(format!("Couldn't publish the world: {e}")));
++                }
++            }
++            Action::E4mcCopy => self.e4mc_copy(),
++            Action::E4mcStop => self.e4mc_stop(),
+             // The system browser, as the folder buttons open their folders.
+             Action::Help => {
+                 if let Some(url) = &view.help {
+@@ -390,6 +408,110 @@ impl Game<'_> {
+                 .copied
+                 .is_some_and(|t| t.elapsed() < Duration::from_secs(2)),
+             steam,
++            e4mc: Some(self.e4mc_view()),
++        }
++    }
++
++    /// Publish the world through e4mc's public relay (the e4mc port): like
++    /// "friends_start", it opens the world to LAN if it isn't, then puts
++    /// the world's domain on the relay. Anyone with the domain joins; the
++    /// screen says so before the button does anything.
++    pub(super) fn e4mc_start(&mut self) -> Result<()> {
++        if self.e4mc.is_some() {
++            return Ok(());
++        }
++        if self.title.is_some() || (self.remote.is_some() && self.integrated.is_none()) {
++            return Err("open a singleplayer world first".into());
++        }
++        let opened_lan =
++            self.lan_port().is_none() && self.friends.is_none() && self.steam.is_none();
++        if self.lan_port().is_none() {
++            self.lan_open(LanSettings {
++                port: horizon_client::lan::available_port(),
++                guest_commands: false,
++                force_game_mode: true,
++            })?;
++        }
++        let port = self.lan_port().ok_or("the world isn't open to LAN")?;
++        match e4mc_friends::Sharing::start(std::net::SocketAddr::from(([127, 0, 0, 1], port))) {
++            Ok(inner) => {
++                self.e4mc = Some(E4mcSharing { inner, opened_lan });
++                Ok(())
++            }
++            Err(e) => {
++                if opened_lan {
++                    self.lan_close(true);
++                }
++                Err(e.into())
++            }
++        }
++    }
++
++    /// Stop publishing: the domain stops answering, guests are dropped.
++    pub(super) fn e4mc_stop(&mut self) {
++        let Some(mut sharing) = self.e4mc.take() else {
++            return;
++        };
++        sharing.inner.stop();
++        if sharing.opened_lan && self.friends.is_none() && self.steam.is_none() {
++            self.lan_close(true);
++        } else {
++            self.system_message(Text::literal("Stopped publishing the world."));
++        }
++    }
++
++    /// e4mc's news, once a tick: the domain, relay notes, guests.
++    pub(super) fn tick_e4mc(&mut self) {
++        let Some(sharing) = self.e4mc.as_mut() else {
++            return;
++        };
++        for event in sharing.inner.tick() {
++            match event {
++                e4mc_friends::Event::Published(domain) => {
++                    self.system_message(Text::literal(format!(
++                        "Your world is now public: {domain} (anyone with the address can join)."
++                    )));
++                }
++                e4mc_friends::Event::Broadcast(message) => {
++                    self.system_message(Text::literal(message));
++                }
++                e4mc_friends::Event::GuestJoined => {
++                    self.system_message(Text::literal("A guest joined through e4mc."))
++                }
++                e4mc_friends::Event::GuestLeft => {
++                    self.system_message(Text::literal("The e4mc guest left."))
++                }
++            }
++        }
++    }
++
++    /// Copy the public domain for a friend to paste.
++    pub(super) fn e4mc_copy(&mut self) {
++        let Some(address) = self.e4mc.as_ref().and_then(|s| s.inner.address()) else {
++            return;
++        };
++        use horizon_client::clipboard::Clipboard;
++        self.clipboard.set(&address);
++        if let Some(s) = self.e4mc.as_mut() {
++            s.inner.mark_copied();
++        }
++    }
++
++    /// What the e4mc section of the view shows.
++    fn e4mc_view(&self) -> friends_screen::E4mcView {
++        let (domain, guests, problem) = match &self.e4mc {
++            Some(s) => {
++                let v = s.inner.view();
++                (v.domain, v.guests, v.problem)
++            }
++            None => (None, 0, None),
++        };
++        friends_screen::E4mcView {
++            publishing: self.e4mc.is_some(),
++            domain,
++            guests,
++            problem,
++            copied: self.e4mc.as_ref().is_some_and(|s| s.inner.just_copied()),
+         }
+     }
+ 
+diff --git a/crates/horizon-e4mc/Cargo.toml b/crates/horizon-e4mc/Cargo.toml
+new file mode 100644
+index 000000000..34569cb70
+--- /dev/null
++++ b/crates/horizon-e4mc/Cargo.toml
+@@ -0,0 +1,26 @@
++[package]
++name = "horizon-e4mc"
++version = "0.1.0"
++edition = "2024"
++license = "GPL-3.0-only"
++description = "Open the world to anyone, anywhere: e4mc's public relay ported to Horizon (a QUIC session with the relay carries the invite domain, its streams carry the guests)"
++
++[dependencies]
++# QUIC client for the relay session (the relay itself is quinn + rustls).
++# ring as the crypto provider: the aws-lc-rs default drags a C toolchain into
++# every build machine for no gain here.
++quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
++rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
++webpki-roots = "0.26"
++tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "io-util", "macros"] }
++# The broker answer and the control channel are JSON.
++serde = { version = "1", features = ["derive"] }
++serde_json = "1.0.151"
++# Errors across the tokio boundary, the quinn TLS setup.
++anyhow = "1"
++# HTTPS to the relay broker (rustls underneath, already in the tree via the client).
++ureq = { version = "2", default-features = false, features = ["tls", "json"] }
++log = { version = "0.4", features = ["std"] }
++
++[lints]
++workspace = true
+diff --git a/crates/horizon-e4mc/src/control.rs b/crates/horizon-e4mc/src/control.rs
+new file mode 100644
+index 000000000..2dd448245
+--- /dev/null
++++ b/crates/horizon-e4mc/src/control.rs
+@@ -0,0 +1,215 @@
++//! The quiclime control channel: messages are JSON with a `kind` field,
++//! framed by a varint length, one message per frame, both ways. The client
++//! asks for a domain, the relay answers with one and then opens one
++//! bidirectional stream per guest, which this crate bridges to the world.
++
++/// The serverbound messages this client sends (e4mc's
++/// `ControlMessageCodec`, the subset a host needs).
++#[derive(Debug, PartialEq, Eq)]
++pub enum Serverbound {
++    ProbeCapabilities,
++    RequestDomainAssignment,
++}
++
++/// The clientbound messages (e4mc's clientbound control messages).
++#[derive(Debug, PartialEq, Eq)]
++pub enum Clientbound {
++    /// The relay's capabilities (e4mc probes them before registering).
++    HasCapabilities(Vec<String>),
++    /// The world's public address is ready.
++    DomainAssignmentComplete(String),
++    /// A relay-wide note the player should see.
++    RequestMessageBroadcast(String),
++    TicketRegistered,
++    UnknownMessage,
++}
++
++impl Serverbound {
++    pub fn to_json(&self) -> Vec<u8> {
++        let kind = match self {
++            Self::ProbeCapabilities => "probe_capabilities",
++            Self::RequestDomainAssignment => "request_domain_assignment",
++        };
++        format!("{{\"kind\":\"{kind}\"}}").into_bytes()
++    }
++}
++
++/// One frame: varint length + the JSON body.
++pub fn frame(message: &[u8]) -> Vec<u8> {
++    let mut out = Vec::with_capacity(message.len() + 5);
++    let mut length = message.len();
++    loop {
++        let byte = (length & 0x7f) as u8;
++        length >>= 7;
++        if length == 0 {
++            out.push(byte);
++            break;
++        }
++        out.push(byte | 0x80);
++    }
++    out.extend_from_slice(message);
++    out
++}
++
++/// A streaming decoder for relay frames: feed it whatever arrived, it hands
++/// back complete messages. `Err` on a frame that claims an impossible size.
++#[derive(Default)]
++pub struct Decoder {
++    buf: Vec<u8>,
++}
++
++impl Decoder {
++    pub fn feed(&mut self, bytes: &[u8]) -> Result<Vec<Clientbound>, &'static str> {
++        self.buf.extend_from_slice(bytes);
++        let mut out = Vec::new();
++        loop {
++            let Some((length, header)) = varint(&self.buf) else {
++                return Ok(out);
++            };
++            if length > 8192 {
++                return Err("the relay sent an oversized control frame");
++            }
++            let end = header + length;
++            if self.buf.len() < end {
++                return Ok(out);
++            }
++            let body = &self.buf[header..end];
++            let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
++                self.buf.drain(..end);
++                out.push(Clientbound::UnknownMessage);
++                continue;
++            };
++            let message = match json.get("kind").and_then(|k| k.as_str()) {
++                Some("has_capabilities") => Clientbound::HasCapabilities(
++                    json.get("caps")
++                        .and_then(|c| c.as_array())
++                        .map(|caps| {
++                            caps.iter()
++                                .filter_map(|c| c.as_str().map(str::to_owned))
++                                .collect()
++                        })
++                        .unwrap_or_default(),
++                ),
++                Some("domain_assignment_complete") => {
++                    match json.get("domain").and_then(|d| d.as_str()) {
++                        Some(domain) => Clientbound::DomainAssignmentComplete(domain.to_owned()),
++                        None => return Err("the relay's domain frame holds no domain"),
++                    }
++                }
++                Some("request_message_broadcast") => Clientbound::RequestMessageBroadcast(
++                    json.get("message")
++                        .and_then(|m| m.as_str())
++                        .unwrap_or_default()
++                        .to_owned(),
++                ),
++                Some("ticket_registered") => Clientbound::TicketRegistered,
++                _ => Clientbound::UnknownMessage,
++            };
++            self.buf.drain(..end);
++            out.push(message);
++        }
++    }
++}
++
++/// A protocol varint: the value and how many bytes it took.
++fn varint(buf: &[u8]) -> Option<(usize, usize)> {
++    let mut value = 0usize;
++    for (i, &b) in buf.iter().take(5).enumerate() {
++        value |= usize::from(b & 0x7f) << (i * 7);
++        if b & 0x80 == 0 {
++            return Some((value, i + 1));
++        }
++    }
++    None
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn frames_round_trip_through_the_decoder() {
++        let mut decoder = Decoder::default();
++        let messages = decoder
++            .feed(
++                &[
++                    frame(br#"{"kind":"has_capabilities","caps":["dialtone_sidecar"]}"#),
++                    frame(br#"{"kind":"domain_assignment_complete","domain":"gone.e4mc.link"}"#),
++                    frame(br#"{"kind":"request_message_broadcast","message":"hello"}"#),
++                    frame(br#"{"kind":"ticket_registered"}"#),
++                ]
++                .concat(),
++            )
++            .unwrap();
++        assert_eq!(
++            messages,
++            vec![
++                Clientbound::HasCapabilities(vec!["dialtone_sidecar".into()]),
++                Clientbound::DomainAssignmentComplete("gone.e4mc.link".into()),
++                Clientbound::RequestMessageBroadcast("hello".into()),
++                Clientbound::TicketRegistered,
++            ]
++        );
++    }
++
++    #[test]
++    fn frames_arriving_in_pieces_decode() {
++        let whole = frame(br#"{"kind":"domain_assignment_complete","domain":"gone.e4mc.link"}"#);
++        let mut decoder = Decoder::default();
++        let mut messages = Vec::new();
++        for chunk in whole.chunks(3) {
++            messages.extend(decoder.feed(chunk).unwrap());
++        }
++        assert_eq!(
++            messages,
++            vec![Clientbound::DomainAssignmentComplete(
++                "gone.e4mc.link".into()
++            )]
++        );
++    }
++
++    #[test]
++    fn unknown_kinds_and_broken_json_become_unknown() {
++        let mut decoder = Decoder::default();
++        let messages = decoder
++            .feed(&[frame(br#"{"kind":"frobnicate"}"#), frame(b"not json")].concat())
++            .unwrap();
++        assert_eq!(messages.len(), 2);
++        assert!(matches!(messages[0], Clientbound::UnknownMessage));
++        assert!(matches!(messages[1], Clientbound::UnknownMessage));
++    }
++
++    #[test]
++    fn oversized_frames_are_refused() {
++        let mut decoder = Decoder::default();
++        assert!(decoder.feed(&[0xff, 0xff, 0xff, 0xff, 0x7f]).is_err());
++    }
++
++    #[test]
++    fn serverbound_messages_serialize_like_the_java_mods() {
++        assert_eq!(
++            Serverbound::ProbeCapabilities.to_json(),
++            br#"{"kind":"probe_capabilities"}"#.to_vec()
++        );
++        assert_eq!(
++            Serverbound::RequestDomainAssignment.to_json(),
++            br#"{"kind":"request_domain_assignment"}"#.to_vec()
++        );
++    }
++
++    #[test]
++    fn frames_carry_multi_byte_lengths() {
++        // A domain long enough that its frame's varint length takes two bytes.
++        let domain = format!("{}{}", "x".repeat(266), ".e4mc.link");
++        let body = format!(r#"{{"kind":"domain_assignment_complete","domain":"{domain}"}}"#);
++        let framed = frame(body.as_bytes());
++        assert!(framed.len() > 255);
++        let mut decoder = Decoder::default();
++        let messages = decoder.feed(&framed).unwrap();
++        assert_eq!(
++            messages,
++            vec![Clientbound::DomainAssignmentComplete(domain)]
++        );
++        assert!(decoder.buf.is_empty(), "the whole frame should be consumed");
++    }
++}
+diff --git a/crates/horizon-e4mc/src/lib.rs b/crates/horizon-e4mc/src/lib.rs
+new file mode 100644
+index 000000000..ce70538aa
+--- /dev/null
++++ b/crates/horizon-e4mc/src/lib.rs
+@@ -0,0 +1,310 @@
++//! Open the world to anyone, anywhere: e4mc ported to Horizon.
++//!
++//! e4mc is the Minecraft mod that publishes an open-to-LAN world through its
++//! public relay: the host connects out to a quiclime relay over QUIC, the
++//! relay assigns the world a public domain, and every guest who joins that
++//! domain arrives as one bidirectional stream on the host's session, which
++//! this crate bridges to the integrated server's loopback port byte for
++//! byte. No port forwarding, no Steam, no account: the address is the
++//! world's, and anyone with it can join — e4mc's own design ("Open a LAN
++//! server to anyone, anywhere, anytime"), so the player is told what
++//! publishing means before they press the button.
++//!
++//! Guests need nothing from this crate: the domain is a plain server
++//! address that any client understands, Horizon's and vanilla's alike.
++//! The reference implementation is e4mc-minecraft-architectury's
++//! `QuiclimeSession` with [e4mc-quiclime] on the relay side; the wire
++//! protocol (ALPN `quiclime`, varint-framed JSON control messages, one
++//! stream per guest) is the same.
++//!
++//! [e4mc-quiclime]: https://github.com/vgskye/e4mc-quiclime
++pub mod control;
++pub mod session;
++
++use session::{SessionConfig, SessionState, Shared};
++use std::{
++    net::SocketAddr,
++    sync::{
++        Arc, Mutex,
++        atomic::{AtomicBool, Ordering},
++        mpsc::{Receiver, Sender, channel},
++    },
++    thread::JoinHandle,
++};
++
++/// How many guests the world carries at once (the integrated server's own
++/// limit; the relay's stream budget is 512).
++pub const MAX_GUESTS: usize = 8;
++
++/// How publishing is set up.
++pub struct PublishConfig {
++    /// The integrated server's loopback address (Open to LAN's port).
++    pub lan: SocketAddr,
++    /// A specific relay, skipping the broker (a self-hosted quiclime or a
++    /// test). None: the broker's least loaded relay.
++    pub relay: Option<(String, u16)>,
++}
++
++/// What the game shows.
++#[derive(Clone, Debug, Default)]
++pub struct PublishState {
++    /// The world's public address (`<name>.e4mc.link`), once assigned.
++    pub domain: Option<String>,
++    /// Guests being carried right now.
++    pub guests: usize,
++    /// Why publishing isn't serving, when the player asked for it.
++    pub problem: Option<String>,
++}
++
++/// What the publisher reports, polled like a tick.
++#[derive(Debug)]
++pub enum PublishEvent {
++    /// The world's public address is ready.
++    Published { domain: String },
++    /// A note the relay asked every host to show its players.
++    Broadcast(String),
++    /// A guest's stream is being carried.
++    GuestJoined,
++    /// The guest's stream ended.
++    GuestLeft,
++    /// The session failed (text for the player).
++    Problem(String),
++}
++
++struct Inner {
++    config: PublishConfig,
++    events: Mutex<Sender<PublishEvent>>,
++    state: Arc<Mutex<SessionState>>,
++    guests: Arc<std::sync::atomic::AtomicUsize>,
++    stop: Arc<tokio::sync::watch::Sender<bool>>,
++    stopped: AtomicBool,
++    thread: Mutex<Option<JoinHandle<()>>>,
++}
++
++/// The publisher, like `horizon_friends::Host`: started in the background,
++/// the game polls it.
++pub struct Publish {
++    inner: Arc<Inner>,
++    events: Receiver<PublishEvent>,
++}
++
++impl Publish {
++    /// Start publishing: reach the relay, publish the domain (a few seconds
++    /// at most), start serving guests.
++    pub fn start(config: PublishConfig) -> Result<Self, String> {
++        let (tx, events) = channel();
++        let (stop, _) = tokio::sync::watch::channel(false);
++        let state = Arc::new(Mutex::new(SessionState::default()));
++        let inner = Arc::new(Inner {
++            config,
++            events: Mutex::new(tx),
++            state: state.clone(),
++            guests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
++            stop: Arc::new(stop),
++            stopped: AtomicBool::new(false),
++            thread: Mutex::new(None),
++        });
++        let shared = Arc::new(Shared {
++            config: SessionConfig {
++                lan: inner.config.lan,
++                relay: inner.config.relay.clone(),
++            },
++            events: inner.events.lock().unwrap().clone(),
++            state,
++            guests: inner.guests.clone(),
++            stop: inner.stop.clone(),
++        });
++        let thread = std::thread::Builder::new()
++            .name("horizon-e4mc".into())
++            .spawn({
++                let shared = shared.clone();
++                move || session::run(shared)
++            })
++            .map_err(|e| format!("e4mc publishing's thread could not start: {e}"))?;
++        *inner.thread.lock().unwrap() = Some(thread);
++        Ok(Self { inner, events })
++    }
++
++    pub fn state(&self) -> PublishState {
++        let session = self.inner.state.lock().unwrap();
++        PublishState {
++            domain: session.domain.clone(),
++            guests: self.inner.guests.load(Ordering::Relaxed),
++            problem: session.problem.clone(),
++        }
++    }
++
++    pub fn poll(&self) -> Vec<PublishEvent> {
++        self.events.try_iter().collect()
++    }
++
++    /// The guests being carried right now.
++    pub fn sessions(&self) -> usize {
++        self.inner.guests.load(Ordering::Relaxed)
++    }
++
++    /// End the publish: the session closes and the domain stops answering.
++    /// Guests already playing are dropped with it: the domain's routing is
++    /// the session, there is nothing to hand over.
++    pub fn stop(&self) {
++        if self.inner.stopped.swap(true, Ordering::Relaxed) {
++            return;
++        }
++        let _ = self.inner.stop.send(true);
++        if let Some(thread) = self.inner.thread.lock().unwrap().take() {
++            let _ = thread.join();
++        }
++    }
++}
++
++impl Drop for Publish {
++    fn drop(&mut self) {
++        self.stop();
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    struct PrintLogger;
++    impl log::Log for PrintLogger {
++        fn enabled(&self, _: &log::Metadata) -> bool {
++            true
++        }
++        fn log(&self, record: &log::Record) {
++            eprintln!("[log] {}", record.args());
++        }
++        fn flush(&self) {}
++    }
++    use super::*;
++    use std::time::Duration;
++
++    /// Stop before anything happened: the state stays empty, no panic.
++    #[test]
++    fn a_stopped_publish_reports_nothing() {
++        let publish = Publish::start(PublishConfig {
++            lan: "127.0.0.1:25565".parse().unwrap(),
++            // The broker is never reached: stopped first thing.
++            relay: Some(("127.0.0.1".into(), 1)),
++        })
++        .unwrap();
++        drop(publish);
++    }
++
++    /// The full chain against the real broker and relay: the domain is
++    /// assigned, a guest joining it arrives at the world's port, bytes flow
++    /// both ways, and stopping tears the session down. `--ignored`: only
++    /// for manual runs, it needs the network and e4mc's public service.
++    #[test]
++    #[ignore = "reaches e4mc's public broker and relay"]
++    fn the_relay_publishes_and_serves_a_guest_end_to_end() {
++        use std::io::{Read, Write};
++        let lan = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        let lan_address = lan.local_addr().unwrap();
++        let publish = Publish::start(PublishConfig {
++            lan: lan_address,
++            relay: None,
++        })
++        .unwrap();
++        let domain = (|| {
++            for _ in 0..150 {
++                for event in publish.poll() {
++                    if let PublishEvent::Published { domain } = event {
++                        return Some(domain);
++                    }
++                }
++                std::thread::sleep(Duration::from_millis(100));
++            }
++            None
++        })()
++        .expect("no domain arrived");
++        eprintln!("e4mc-test: domain {domain}, joining as a guest...");
++        let _ = log::set_boxed_logger(Box::new(PrintLogger));
++        log::set_max_level(log::LevelFilter::Info);
++        assert!(domain.ends_with(".e4mc.link"), "{domain}");
++        assert_eq!(publish.state().domain.as_deref(), Some(domain.as_str()));
++
++        // A guest joins the domain like any vanilla client would: its first
++        // bytes are the Minecraft handshake, whose virtual host names the
++        // domain; the relay routes on it and forwards the packet as-is.
++        let handshake = {
++            fn varint(mut value: usize, out: &mut Vec<u8>) {
++                loop {
++                    let byte = (value & 0x7f) as u8;
++                    value >>= 7;
++                    if value == 0 {
++                        out.push(byte);
++                        break;
++                    }
++                    out.push(byte | 0x80);
++                }
++            }
++            fn string(value: &str, out: &mut Vec<u8>) {
++                varint(value.len(), out);
++                out.extend_from_slice(value.as_bytes());
++            }
++            let mut body = vec![0x00]; // packet id: handshake
++            varint(767, &mut body); // protocol
++            string(&domain, &mut body); // the virtual host the client dialed
++            body.extend_from_slice(&25565u16.to_be_bytes());
++            varint(2, &mut body); // next state: login
++            let mut packet = Vec::new();
++            varint(body.len(), &mut packet);
++            packet.extend_from_slice(&body);
++            packet
++        };
++        use std::net::ToSocketAddrs;
++        let guest_address = (domain.as_str(), 25565)
++            .to_socket_addrs()
++            .expect("dns")
++            .next()
++            .expect("the domain didn't resolve");
++        eprintln!("e4mc-test: guest dials {guest_address}");
++        let mut guest = None;
++        for _ in 0..30 {
++            match std::net::TcpStream::connect_timeout(&guest_address, Duration::from_secs(1)) {
++                Ok(stream) => {
++                    guest = Some(stream);
++                    break;
++                }
++                Err(_) => std::thread::sleep(Duration::from_millis(500)),
++            }
++        }
++        let mut guest = guest.expect("the domain didn't answer");
++        eprintln!("e4mc-test: guest connected, sending the handshake");
++        guest.write_all(&handshake).unwrap();
++        let mut buffer = vec![0u8; handshake.len()];
++        lan.set_nonblocking(false).unwrap();
++        let (mut world, _) = lan.accept().unwrap();
++        world.read_exact(&mut buffer).unwrap();
++        assert_eq!(
++            buffer, handshake,
++            "the relay must forward the handshake verbatim"
++        );
++        eprintln!("e4mc-test: handshake reached the world, playing bytes...");
++        guest.write_all(b"hello").unwrap();
++        let mut rest = [0u8; 5];
++        world.read_exact(&mut rest).unwrap();
++        assert_eq!(&rest, b"hello");
++        world.write_all(b"world").unwrap();
++        let mut back = [0u8; 5];
++        guest.read_exact(&mut back).unwrap();
++        assert_eq!(&back, b"world");
++        assert_eq!(publish.sessions(), 1);
++
++        // Stopping ends the session: the guest's stream closes.
++        publish.stop();
++        eprintln!("e4mc-test: stopped, waiting for the guest's EOF...");
++        guest
++            .set_read_timeout(Some(Duration::from_secs(20)))
++            .unwrap();
++        let mut ended = [0u8; 1];
++        assert_eq!(guest.read(&mut ended).unwrap(), 0);
++        for _ in 0..50 {
++            if publish.sessions() == 0 {
++                break;
++            }
++            std::thread::sleep(Duration::from_millis(100));
++        }
++        assert_eq!(publish.sessions(), 0);
++    }
++}
+diff --git a/crates/horizon-e4mc/src/session.rs b/crates/horizon-e4mc/src/session.rs
+new file mode 100644
+index 000000000..1f797d624
+--- /dev/null
++++ b/crates/horizon-e4mc/src/session.rs
+@@ -0,0 +1,294 @@
++//! The relay session, on its own thread inside a small tokio runtime: fetch
++//! a relay from the broker, connect over QUIC, open the control stream,
++//! publish the assigned domain, then bridge every stream the relay opens
++//! (one per guest) to the world's loopback port, byte for byte. e4mc's
++//! `QuiclimeSession` is the reference; the shape is the same as
++//! horizon-steam's share and horizon-friends' host: started in the
++//! background, polled by the game.
++use crate::control::{self, Clientbound, Decoder, Serverbound};
++use quinn::{Endpoint, RecvStream, SendStream};
++use std::{
++    net::SocketAddr,
++    sync::{
++        Arc, Mutex,
++        atomic::{AtomicUsize, Ordering},
++        mpsc::Sender,
++    },
++    time::Duration,
++};
++use tokio::{io::AsyncWriteExt, net::TcpStream, sync::watch};
++
++/// The e4mc broker hands out the least loaded relay.
++pub const BROKER_URL: &str = "https://broker.e4mc.link/getBestRelay";
++/// The ALPN both ends of the relay session speak.
++const ALPN: &[u8] = b"quiclime";
++/// How many guest streams the session advertises (the Java client's 512;
++/// the integrated server's own limit of 8 is what actually gates).
++const MAX_STREAMS: u32 = 512;
++/// QUIC keep-alive: the relay's own is 5 s, so ours must be shorter or the
++/// session dies during quiet periods.
++const KEEP_ALIVE: Duration = Duration::from_secs(3);
++
++pub struct SessionConfig {
++    /// The world's loopback port (Open to LAN's).
++    pub lan: SocketAddr,
++    /// A specific relay, skipping the broker (a self-hosted quiclime, tests).
++    pub relay: Option<(String, u16)>,
++}
++
++#[derive(Default)]
++pub struct SessionState {
++    pub domain: Option<String>,
++    pub guests: usize,
++    pub problem: Option<String>,
++}
++
++pub(crate) struct Shared {
++    pub config: SessionConfig,
++    pub events: Sender<crate::PublishEvent>,
++    pub state: Arc<Mutex<SessionState>>,
++    pub guests: Arc<AtomicUsize>,
++    pub stop: Arc<watch::Sender<bool>>,
++}
++
++impl Shared {
++    fn emit(&self, event: crate::PublishEvent) {
++        let _ = self.events.send(event);
++    }
++    pub fn stopped(&self) -> bool {
++        *self.stop.borrow()
++    }
++    fn set_problem(&self, problem: String) {
++        self.state.lock().unwrap().problem = Some(problem.clone());
++        self.emit(crate::PublishEvent::Problem(problem));
++    }
++}
++
++/// The thread body: one runtime, one session, until stopped or failed.
++pub(crate) fn run(shared: Arc<Shared>) {
++    // The broker is plain HTTPS and blocking; it runs before the runtime.
++    let relay = shared.config.relay.clone().map(Ok).unwrap_or_else(|| {
++        broker_relay().map_err(|e| {
++            if !shared.stopped() {
++                shared.set_problem(format!("the relay broker didn't answer: {e}"));
++            }
++            e
++        })
++    });
++    let relay = match relay {
++        Ok(relay) => relay,
++        Err(_) => return,
++    };
++    let runtime = tokio::runtime::Builder::new_current_thread()
++        .enable_all()
++        .build()
++        .expect("e4mc: tokio runtime");
++    let stop = shared.stop.subscribe();
++    runtime.block_on(async {
++        // The endpoint must outlive the session: dropping it kills the
++        // connections silently, without the close frame that tells the relay
++        // to end its guests. It is released only after wait_idle.
++        let endpoint = match make_endpoint() {
++            Ok(endpoint) => endpoint,
++            Err(error) => {
++                if !shared.stopped() {
++                    shared.set_problem(error.to_string());
++                }
++                return;
++            }
++        };
++        let result = session(&shared, relay, stop.clone(), &endpoint).await;
++        if let Err(error) = result
++            && !shared.stopped()
++        {
++            shared.set_problem(error.to_string());
++        }
++        if shared.stopped() {
++            // The close frame has to reach the relay before the socket dies.
++            let _ = tokio::time::timeout(Duration::from_secs(3), endpoint.wait_idle()).await;
++        }
++    });
++    log::info!("e4mc: session ended, shutting the runtime down");
++    runtime.shutdown_timeout(Duration::from_secs(2));
++}
++
++fn broker_relay() -> Result<(String, u16), String> {
++    let response = ureq::get(BROKER_URL)
++        .set("Accept", "application/json")
++        .timeout(std::time::Duration::from_secs(10))
++        .call()
++        .map_err(|e| e.to_string())?;
++    let broker: BrokerResponse = response
++        .into_json()
++        .map_err(|e| format!("the broker's answer made no sense: {e}"))?;
++    Ok((broker.host, broker.port))
++}
++
++#[derive(serde::Deserialize)]
++struct BrokerResponse {
++    #[allow(dead_code)]
++    id: String,
++    host: String,
++    port: u16,
++}
++
++fn make_endpoint() -> anyhow::Result<Endpoint> {
++    let mut root = rustls::RootCertStore::empty();
++    root.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
++    let mut tls = rustls::ClientConfig::builder()
++        .with_root_certificates(root)
++        .with_no_client_auth();
++    tls.alpn_protocols = vec![ALPN.to_vec()];
++    let mut transport = quinn::TransportConfig::default();
++    transport.keep_alive_interval(Some(KEEP_ALIVE));
++    transport.max_concurrent_bidi_streams(MAX_STREAMS.into());
++    transport
++        .stream_receive_window((1_250_000u32).into())
++        .receive_window((8_000_000u32).into());
++    let mut client = quinn::ClientConfig::new(Arc::new(
++        quinn::crypto::rustls::QuicClientConfig::try_from(tls)?,
++    ));
++    client.transport_config(Arc::new(transport));
++    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
++    endpoint.set_default_client_config(client);
++    Ok(endpoint)
++}
++
++async fn session(
++    shared: &Arc<Shared>,
++    (host, port): (String, u16),
++    mut stop: watch::Receiver<bool>,
++    endpoint: &Endpoint,
++) -> anyhow::Result<()> {
++    log::info!("e4mc: using relay {host}:{port}");
++
++    let address = tokio::net::lookup_host((host.as_str(), port))
++        .await?
++        .next()
++        .ok_or_else(|| anyhow::anyhow!("the relay's name didn't resolve"))?;
++    let connecting = endpoint.connect(address, host.as_str())?;
++    // A relay that doesn't answer hangs the handshake forever without this.
++    let connection = tokio::select! {
++        _ = stop.changed() => return Ok(()),
++        connection = tokio::time::timeout(Duration::from_secs(10), connecting) => {
++            connection.map_err(|_| anyhow::anyhow!("the relay didn't answer in 10 seconds"))??
++        }
++    };
++    log::info!("e4mc: relay session open");
++
++    // The control channel: one bidirectional stream carries the domain
++    // negotiation and the relay's broadcasts. It stays open.
++    let (mut send_control, mut recv_control) = connection.open_bi().await?;
++    write_message(&mut send_control, &Serverbound::ProbeCapabilities).await?;
++    write_message(&mut send_control, &Serverbound::RequestDomainAssignment).await?;
++    let mut decoder = Decoder::default();
++    let mut buf = vec![0u8; 4096];
++    let domain = 'domain: loop {
++        let read = tokio::select! {
++            _ = stop.changed() => return Ok(()),
++            read = recv_control.read(&mut buf) => match read {
++                Ok(Some(read)) => read,
++                Ok(None) => anyhow::bail!("the relay closed the control channel before assigning a domain"),
++                Err(e) => return Err(e.into()),
++            },
++        };
++        for message in decoder.feed(&buf[..read]).map_err(anyhow::Error::msg)? {
++            if let Clientbound::DomainAssignmentComplete(domain) = message {
++                break 'domain domain;
++            }
++        }
++    };
++    log::info!("e4mc: domain assigned: {domain}");
++    shared.state.lock().unwrap().domain = Some(domain.clone());
++    shared.emit(crate::PublishEvent::Published { domain });
++
++    // Serving: the relay's broadcasts on the control channel, and one
++    // bidirectional stream per guest.
++    loop {
++        tokio::select! {
++            _ = stop.changed() => {
++                log::info!("e4mc: stop asked: closing the relay session");
++                connection.close(0u32.into(), b"horizon stopped sharing");
++                return Ok(());
++            }
++            read = recv_control.read(&mut buf) => {
++                let read = match read {
++                    Ok(Some(read)) => read,
++                    Ok(None) => anyhow::bail!("the relay closed the session"),
++                    Err(e) => return Err(e.into()),
++                };
++                for message in decoder.feed(&buf[..read]).map_err(anyhow::Error::msg)? {
++                    match message {
++                        Clientbound::RequestMessageBroadcast(message) => {
++                            shared.emit(crate::PublishEvent::Broadcast(message))
++                        }
++                        Clientbound::DomainAssignmentComplete(domain) => {
++                            shared.state.lock().unwrap().domain = Some(domain);
++                        }
++                        _ => {}
++                    }
++                }
++            }
++            stream = connection.accept_bi() => {
++                let (send, recv) = stream?;
++                tokio::spawn(bridge(shared.clone(), send, recv));
++            }
++        }
++    }
++}
++
++async fn write_message(send: &mut SendStream, message: &Serverbound) -> anyhow::Result<()> {
++    send.write_all(&control::frame(&message.to_json())).await?;
++    Ok(())
++}
++
++/// Returns the guest count to zero when the bridge ends, however it ends:
++/// the runtime cancels the task on shutdown, and a plain decrement after
++/// the pump would be skipped with it.
++struct GuestGuard {
++    shared: Arc<Shared>,
++}
++
++impl Drop for GuestGuard {
++    fn drop(&mut self) {
++        self.shared.guests.fetch_sub(1, Ordering::Relaxed);
++        self.shared.state.lock().unwrap().guests -= 1;
++        self.shared.emit(crate::PublishEvent::GuestLeft);
++    }
++}
++
++/// One guest: the relay opened a stream, bridge it to the world's port
++/// until either side ends it. Half-closes carry through: a guest's EOF
++/// reaches the server and the server's EOF reaches the guest.
++async fn bridge(shared: Arc<Shared>, mut send: SendStream, mut recv: RecvStream) {
++    shared.guests.fetch_add(1, Ordering::Relaxed);
++    shared.state.lock().unwrap().guests += 1;
++    shared.emit(crate::PublishEvent::GuestJoined);
++    let _guard = GuestGuard {
++        shared: shared.clone(),
++    };
++    let result = match TcpStream::connect(shared.config.lan).await {
++        Ok(server) => {
++            let (mut server_read, mut server_write) = server.into_split();
++            let to_server = async {
++                let copied = tokio::io::copy(&mut recv, &mut server_write).await;
++                let _ = server_write.shutdown().await;
++                copied
++            };
++            let to_guest = tokio::io::copy(&mut server_read, &mut send);
++            let (a, b) = tokio::join!(to_server, to_guest);
++            let _ = send.finish();
++            match (a, b) {
++                (Ok(_), Ok(_)) => Ok(()),
++                (Err(e), _) | (_, Err(e)) => Err(anyhow::anyhow!(e)),
++            }
++        }
++        Err(e) => {
++            let _ = send.finish();
++            Err(anyhow::anyhow!(e))
++        }
++    };
++    if let Err(e) = result {
++        log::info!("e4mc: a guest's bridge ended: {e}");
++    }
++}
+diff --git a/docs/README.md b/docs/README.md
+index 8cc574698..92930dc30 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -24,6 +24,7 @@ To play, use [the launcher](../launcher/README.md); the project site is [playhor
+ - [Horizon APIs](api/README.md): every surface other programs build on (mods, shaders, agent control, servers, the launcher, data formats), each with its guide, generated reference, stability and changelog, and the [stability and versioning policy](api/stability.md).
+ - Menus: every screen is vanilla's (title, world list, create world, multiplayer, options, pause). Horizon's own settings hang off vanilla's Options the way mods add theirs: **Horizon Settings...** and **Mods...** in the last two slots of the Options grid (Horizon Settings opens Graphics, Advanced Graphics, Controller Settings, Extras and Mods, each a vanilla options list), with Horizon Graphics and Advanced Graphics also at the top of Video Settings and Controller Settings at the bottom of Controls. The title screen's and pause menu's Friends buttons open Join a Friend and Play with Friends ([play-with-friends.md](play-with-friends.md)).
+ - [Play with Steam friends](steam-friends.md): the e4steam mod ported — a singleplayer world opened to a Steam lobby, friends joining over Steam's P2P networking, and the mod's per-Steam-account identity.
++- [Publish the world to anyone (e4mc)](e4mc.md): the e4mc mod ported — the world's public address through e4mc's relay, joinable from any client.
+ 
+ ## Parity
+ 
+diff --git a/docs/e4mc.md b/docs/e4mc.md
+new file mode 100644
+index 000000000..e113ba9a1
+--- /dev/null
++++ b/docs/e4mc.md
+@@ -0,0 +1,62 @@
++# Publish the world to anyone (e4mc)
++
++A Horizon port of [e4mc](https://github.com/vgskye/e4mc-minecraft-architectury),
++the "Open a LAN server to anyone, anywhere, anytime" mod: the open world is
++published through e4mc's public relay and gets a public address that creates
++itself. Anyone who has it joins, even from vanilla Minecraft — no Steam, no
++port forwarding, no invitation. The implementation lives in
++`crates/horizon-e4mc`; the client's part is `game/e4mc_friends.rs` and
++`game/friends.rs`.
++
++This is the sibling of the Steam sharing
++([steam-friends.md](steam-friends.md), the e4steam port): Steam sharing is
++friends-only with per-Steam-account identity, e4mc publishing is public with
++no identity at all. Both sit on the same Play with Friends screen and both
++carry the integrated server's stream to the world's LAN port unchanged.
++
++## How it works
++
++The host connects out to a [quiclime](https://github.com/vgskye/e4mc-quiclime)
++relay over QUIC (ALPN `quiclime`, the broker's least loaded one), asks it for
++a domain assignment, and the relay answers with the world's address, like
++`oink-unwell.eu.e4mc.link`. Each guest who joins the domain arrives at the
++relay as a TCP connection, is identified by the Minecraft handshake's virtual
++host, and becomes one bidirectional QUIC stream on the host's session — the
++relay forwards the handshake as the first bytes. The host bridges every
++stream to the integrated server's loopback port byte for byte; guests are
++plain LAN guests from there. Steam encrypts its transport; here the relay
++sees the game's plaintext (e4mc's own design: the address is public, the
++mod trusts nothing about the joiners, and vanilla's ban list works as
++usual — the mod patches bans to stick to the relay's view of the address,
++which this port does not need: the integrated server has its own handling).
++
++Stopping the publish closes the session: the domain stops answering, and
++guests still playing are dropped with it. The domain lives as long as the
++publish does.
++
++## Playing
++
++Open a singleplayer world, pause, **Play with Friends**. The **Anyone
++(e4mc)** section: **Publish to Anyone** opens the world to LAN if it isn't
++(Open to LAN's defaults), reaches the relay and shows the green address —
++copyable, and joinable as a plain server address from any client. The chat
++announces it too. **Stop Publishing** takes the world back down.
++
++The address is public by design: anyone who finds it joins. For friends-only
++play use the invite code or the Steam section instead.
++
++## Testing
++
++`cargo test -p horizon-e4mc` covers the control codec (frames in pieces,
++unknown kinds, oversized frames, multi-byte lengths) and the facade. One
++`--ignored` test runs the whole chain live against e4mc's public broker and
++relay: a domain is assigned, a guest joins it with a real Minecraft
++handshake, bytes flow both ways, and stopping disconnects the guest. Run it
++by hand, it needs the network and e4mc's public service:
++
++```sh
++cargo test -p horizon-e4mc -- --ignored --nocapture
++```
++
++`E4MC_RELAY=host:port` pins a self-hosted quiclime relay instead of the
++broker (the mod's `relayHost`/`relayPort`).
+diff --git a/docs/play-with-friends.md b/docs/play-with-friends.md
+index c659b26af..8499cd2b1 100644
+--- a/docs/play-with-friends.md
++++ b/docs/play-with-friends.md
+@@ -7,7 +7,9 @@ There is no Horizon server in the middle and no account: the code itself says wh
+ holds the key that encrypts the game between them.
+ 
+ The same screen also offers **Steam sharing** ([steam-friends.md](steam-friends.md)): the world open
+-to a Steam lobby, friends joining over Steam's own P2P networking — the e4steam mod, ported.
++to a Steam lobby, friends joining over Steam's own P2P networking — the e4steam mod, ported. And
++**e4mc publishing** ([e4mc.md](e4mc.md)): the world's public address on e4mc's relay, joinable by
++anyone from any client — the e4mc mod, ported.
+ 
+ It is built on Open to LAN: the integrated server (`crates/horizon-client/src/lan`) listens on a local
+ TCP port and speaks the vanilla protocol. Play with friends puts an encrypted tunnel in front of that
+-- 
+2.55.0.windows.5
+
+
+From 45533bb13bbf8344abcc0d9c8bc46c7a9958d77a Mon Sep 17 00:00:00 2001
+From: sambukuper <sambukuper@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 04:31:20 +0300
+Subject: [PATCH 2/4] Open to LAN publishes the world on its own
+
+The original mods started the moment the world opened to LAN, so the
+ports do too: ShareToLanScreen's Open to LAN now starts the Steam
+friends share (when Steam is signed in) and the e4mc publish, and the
+chat announces both. The friends screens keep opening the LAN quietly
+before their own share. The Mods page lists the two ports as built in.
+
+Co-Authored-By: ZCode (GLM-5.3-Flash) <noreply@z.ai>
+---
+ crates/horizon-client/src/game/friends.rs | 30 +++++++-
+ crates/horizon-client/src/game/lan.rs     | 12 ++++
+ crates/horizon-client/src/options_ui.rs   | 88 +++++++++++++----------
+ docs/e4mc.md                              |  5 ++
+ docs/steam-friends.md                     |  5 ++
+ 5 files changed, 100 insertions(+), 40 deletions(-)
+
+diff --git a/crates/horizon-client/src/game/friends.rs b/crates/horizon-client/src/game/friends.rs
+index 6be3b809c..da21547f8 100644
+--- a/crates/horizon-client/src/game/friends.rs
++++ b/crates/horizon-client/src/game/friends.rs
+@@ -82,7 +82,7 @@ impl Game<'_> {
+         let opened_lan = self.lan_port().is_none();
+         if opened_lan {
+             // ShareToLanScreen's defaults, as the world options screen offers them.
+-            self.lan_open(LanSettings {
++            self.lan_open_quiet(LanSettings {
+                 port: horizon_client::lan::available_port(),
+                 guest_commands: false,
+                 force_game_mode: true,
+@@ -155,6 +155,30 @@ impl Game<'_> {
+         }
+     }
+ 
++    /// The world just opened to LAN: the original mods start here, so the
++    /// ports do too. Best effort: a problem becomes a chat line; the LAN
++    /// open itself stands.
++    pub(super) fn friends_auto_publish(&mut self) {
++        if self.steam.is_none() && steam_friends::Sharing::available() {
++            match self.steam_start(steam_friends::Access::Friends) {
++                Ok(()) => self.system_message(Text::literal(
++                    "Steam: your friends can join (Play with Friends has the details).",
++                )),
++                Err(e) => {
++                    self.system_message(Text::literal(format!("Steam sharing didn't start: {e}")))
++                }
++            }
++        }
++        if self.e4mc.is_none() {
++            match self.e4mc_start() {
++                Ok(()) => self.system_message(Text::literal(
++                    "e4mc: the world is going public, its address lands here shortly.",
++                )),
++                Err(e) => self.system_message(Text::literal(format!("e4mc didn't start: {e}"))),
++            }
++        }
++    }
++
+     /// Open the world to Steam friends (the e4steam port): like
+     /// `friends_start`, it opens the world to LAN if it isn't, then shares
+     /// that port through a Steam lobby and Steam's P2P networking.
+@@ -167,7 +191,7 @@ impl Game<'_> {
+         }
+         let opened_lan = self.lan_port().is_none() && self.friends.is_none() && self.e4mc.is_none();
+         if self.lan_port().is_none() {
+-            self.lan_open(LanSettings {
++            self.lan_open_quiet(LanSettings {
+                 port: horizon_client::lan::available_port(),
+                 guest_commands: false,
+                 force_game_mode: true,
+@@ -426,7 +450,7 @@ impl Game<'_> {
+         let opened_lan =
+             self.lan_port().is_none() && self.friends.is_none() && self.steam.is_none();
+         if self.lan_port().is_none() {
+-            self.lan_open(LanSettings {
++            self.lan_open_quiet(LanSettings {
+                 port: horizon_client::lan::available_port(),
+                 guest_commands: false,
+                 force_game_mode: true,
+diff --git a/crates/horizon-client/src/game/lan.rs b/crates/horizon-client/src/game/lan.rs
+index 83fdaf4be..0710adbb7 100644
+--- a/crates/horizon-client/src/game/lan.rs
++++ b/crates/horizon-client/src/game/lan.rs
+@@ -1053,7 +1053,19 @@ impl Game<'_> {
+         }
+     }
+ 
++    /// ShareToLanScreen's "Open to LAN": the port goes live and, like the
++    /// original e4mc and e4steam mods, the world publishes itself (the e4mc
++    /// address lands in chat, Steam friends get a join button).
+     pub(super) fn lan_open(&mut self, settings: LanSettings) -> Result<()> {
++        self.lan_open_quiet(settings)?;
++        self.friends_auto_publish();
++        Ok(())
++    }
++
++    /// The LAN half of "lan_open" without the automatic publishing: the
++    /// friends screens open the LAN this way before starting their own
++    /// share, and the announcement is theirs to make.
++    pub(super) fn lan_open_quiet(&mut self, settings: LanSettings) -> Result<()> {
+         let port = if let Some(server) = &self.integrated {
+             // ShareToLanScreen: IntegratedServer.publishServer.
+             server
+diff --git a/crates/horizon-client/src/options_ui.rs b/crates/horizon-client/src/options_ui.rs
+index 5a7acab15..86eeba38d 100644
+--- a/crates/horizon-client/src/options_ui.rs
++++ b/crates/horizon-client/src/options_ui.rs
+@@ -1486,45 +1486,59 @@ impl OptionsUi {
+             }
+             Page::Font => pairs(&[Opt::ForceUnicode, Opt::JapaneseGlyphs]),
+             Page::Mods => {
++                // The built-in multiplayer ports: not .hmod files, but this
++                // screen is where a player looks for what the game can load
++                // (docs/e4mc.md, docs/steam-friends.md).
++                let mut rows = vec![
++                    Row::Header("Built in: e4mc and Steam friends"),
++                    Row::Note(
++                        "Open the world to LAN: the e4mc address lands in chat \
++                         and Steam friends get a join button."
++                            .to_owned(),
++                    ),
++                ];
+                 if s.mods.installed.is_empty() {
+-                    return vec![Row::Header(
+-                        "No mods: put .hmod files in the horizon-mods folder",
+-                    )];
++                    rows.push(Row::Header(
++                        "No .hmod mods: put .hmod files in the horizon-mods folder",
++                    ));
++                    return rows;
+                 }
+-                s.mods
+-                    .installed
+-                    .iter()
+-                    .enumerate()
+-                    .map(|(i, installed)| {
+-                        let mut label = Text::literal(format!("{}: ", installed.title))
+-                            .append(on_off(s.mods.is_on(i)));
+-                        if installed.problem.is_some() {
+-                            label = label.append(" (Stopped)");
+-                        } else if installed.dev {
+-                            label = label.append(" (Dev)");
+-                        }
+-                        let dead = installed.dev || installed.id.is_empty();
+-                        // A running mod with a settings page (capability
+-                        // `ui`) gets its own button beside the toggle.
+-                        if installed.has_settings {
+-                            let toggle = button(0.0, 0.0, 150.0, label, Act::ToggleMod(i));
+-                            let settings = button(
+-                                0.0,
+-                                0.0,
+-                                150.0,
+-                                Text::literal("Settings"),
+-                                Act::ModSettings(i),
+-                            );
+-                            Row::Buttons(
+-                                if dead { inactive(toggle) } else { toggle },
+-                                Some(settings),
+-                            )
+-                        } else {
+-                            let widget = button(0.0, 0.0, 310.0, label, Act::ToggleMod(i));
+-                            Row::Buttons(if dead { inactive(widget) } else { widget }, None)
+-                        }
+-                    })
+-                    .collect()
++                rows.extend(
++                    s.mods
++                        .installed
++                        .iter()
++                        .enumerate()
++                        .map(|(i, installed)| {
++                            let mut label = Text::literal(format!("{}: ", installed.title))
++                                .append(on_off(s.mods.is_on(i)));
++                            if installed.problem.is_some() {
++                                label = label.append(" (Stopped)");
++                            } else if installed.dev {
++                                label = label.append(" (Dev)");
++                            }
++                            let dead = installed.dev || installed.id.is_empty();
++                            // A running mod with a settings page (capability
++                            // `ui`) gets its own button beside the toggle.
++                            if installed.has_settings {
++                                let toggle = button(0.0, 0.0, 150.0, label, Act::ToggleMod(i));
++                                let settings = button(
++                                    0.0,
++                                    0.0,
++                                    150.0,
++                                    Text::literal("Settings"),
++                                    Act::ModSettings(i),
++                                );
++                                Row::Buttons(
++                                    if dead { inactive(toggle) } else { toggle },
++                                    Some(settings),
++                                )
++                            } else {
++                                let widget = button(0.0, 0.0, 310.0, label, Act::ToggleMod(i));
++                                Row::Buttons(if dead { inactive(widget) } else { widget }, None)
++                            }
++                        }),
++                );
++                rows
+             }
+             Page::ShaderPacks => {
+                 if s.shader_packs.is_empty() {
+diff --git a/docs/e4mc.md b/docs/e4mc.md
+index e113ba9a1..c0669b30c 100644
+--- a/docs/e4mc.md
++++ b/docs/e4mc.md
+@@ -42,6 +42,11 @@ Open a singleplayer world, pause, **Play with Friends**. The **Anyone
+ copyable, and joinable as a plain server address from any client. The chat
+ announces it too. **Stop Publishing** takes the world back down.
+ 
++The mod published the world by itself the moment it opened to LAN, and the
++port does the same: a plain **Open to LAN** also reaches the relay, and the
++green address lands in the chat on its own. The Options screen's Mods page
++lists the port as built in.
++
+ The address is public by design: anyone who finds it joins. For friends-only
+ play use the invite code or the Steam section instead.
+ 
+diff --git a/docs/steam-friends.md b/docs/steam-friends.md
+index 1e332ff53..46c602386 100644
+--- a/docs/steam-friends.md
++++ b/docs/steam-friends.md
+@@ -55,6 +55,11 @@ names both versions, as the relay's does), connects over Steam's P2P network,
+ and logs in under the name of their own Steam account. Guests over Steam are
+ LAN guests to the world: 8 players at once, the same as Open to LAN.
+ 
++The original mod shared as soon as the world opened to LAN, and the port
++does the same: a plain **Open to LAN** starts a friends-lobby share on its
++own, and the chat says so. The Options screen's Mods page lists the port as
++built in.
++
+ No router changes, no relay, no VPN: Steam carries the traffic, as it does for
+ every Steam game's multiplayer. Both players need Steam running and signed in;
+ the usual Steam troubleshooting (`SteamAPI_Init failed`) applies, as
+-- 
+2.55.0.windows.5
+
+
+From ed853c6d2d9fcf232fb591240b6e8187620612e3 Mon Sep 17 00:00:00 2001
+From: sambukuper <sambukuper@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 04:31:45 +0300
+Subject: [PATCH 3/4] Format options_ui
+
+Co-Authored-By: ZCode (GLM-5.3-Flash) <noreply@z.ai>
+---
+ crates/horizon-client/src/options_ui.rs | 61 +++++++++++--------------
+ 1 file changed, 26 insertions(+), 35 deletions(-)
+
+diff --git a/crates/horizon-client/src/options_ui.rs b/crates/horizon-client/src/options_ui.rs
+index 86eeba38d..53c035da3 100644
+--- a/crates/horizon-client/src/options_ui.rs
++++ b/crates/horizon-client/src/options_ui.rs
+@@ -1503,41 +1503,32 @@ impl OptionsUi {
+                     ));
+                     return rows;
+                 }
+-                rows.extend(
+-                    s.mods
+-                        .installed
+-                        .iter()
+-                        .enumerate()
+-                        .map(|(i, installed)| {
+-                            let mut label = Text::literal(format!("{}: ", installed.title))
+-                                .append(on_off(s.mods.is_on(i)));
+-                            if installed.problem.is_some() {
+-                                label = label.append(" (Stopped)");
+-                            } else if installed.dev {
+-                                label = label.append(" (Dev)");
+-                            }
+-                            let dead = installed.dev || installed.id.is_empty();
+-                            // A running mod with a settings page (capability
+-                            // `ui`) gets its own button beside the toggle.
+-                            if installed.has_settings {
+-                                let toggle = button(0.0, 0.0, 150.0, label, Act::ToggleMod(i));
+-                                let settings = button(
+-                                    0.0,
+-                                    0.0,
+-                                    150.0,
+-                                    Text::literal("Settings"),
+-                                    Act::ModSettings(i),
+-                                );
+-                                Row::Buttons(
+-                                    if dead { inactive(toggle) } else { toggle },
+-                                    Some(settings),
+-                                )
+-                            } else {
+-                                let widget = button(0.0, 0.0, 310.0, label, Act::ToggleMod(i));
+-                                Row::Buttons(if dead { inactive(widget) } else { widget }, None)
+-                            }
+-                        }),
+-                );
++                rows.extend(s.mods.installed.iter().enumerate().map(|(i, installed)| {
++                    let mut label = Text::literal(format!("{}: ", installed.title))
++                        .append(on_off(s.mods.is_on(i)));
++                    if installed.problem.is_some() {
++                        label = label.append(" (Stopped)");
++                    } else if installed.dev {
++                        label = label.append(" (Dev)");
++                    }
++                    let dead = installed.dev || installed.id.is_empty();
++                    // A running mod with a settings page (capability
++                    // `ui`) gets its own button beside the toggle.
++                    if installed.has_settings {
++                        let toggle = button(0.0, 0.0, 150.0, label, Act::ToggleMod(i));
++                        let settings = button(
++                            0.0,
++                            0.0,
++                            150.0,
++                            Text::literal("Settings"),
++                            Act::ModSettings(i),
++                        );
++                        Row::Buttons(if dead { inactive(toggle) } else { toggle }, Some(settings))
++                    } else {
++                        let widget = button(0.0, 0.0, 310.0, label, Act::ToggleMod(i));
++                        Row::Buttons(if dead { inactive(widget) } else { widget }, None)
++                    }
++                }));
+                 rows
+             }
+             Page::ShaderPacks => {
+-- 
+2.55.0.windows.5
+
+
+From 6b750496bc4a06ce17f273c6fc29eccd9d40dad2 Mon Sep 17 00:00:00 2001
+From: sambukuper <sambukuper@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 05:17:26 +0300
+Subject: [PATCH 4/4] The world options screen and /publish start the ports too
+
+The user's Open to LAN goes through the world options screen, where the
+integrated server publishes by itself; that path skipped the auto
+publish, as did /publish. Both start the Steam and e4mc shares now, and
+turning the LAN off or moving its port keeps them in step.
+
+Co-Authored-By: ZCode (GLM-5.3-Flash) <noreply@z.ai>
+---
+ .../horizon-client/src/game/commands/extra.rs |  2 ++
+ crates/horizon-client/src/game/lan_screen.rs  | 31 ++++++++++++++-----
+ 2 files changed, 25 insertions(+), 8 deletions(-)
+
+diff --git a/crates/horizon-client/src/game/commands/extra.rs b/crates/horizon-client/src/game/commands/extra.rs
+index f116ad6fe..bbe9d4f0c 100644
+--- a/crates/horizon-client/src/game/commands/extra.rs
++++ b/crates/horizon-client/src/game/commands/extra.rs
+@@ -798,6 +798,8 @@ impl Game<'_> {
+         if !started {
+             return Err(err("commands.publish.failed", &[]));
+         }
++        // Like Open to LAN's screens: the ports start with the world.
++        self.friends_auto_publish();
+         let port_text = port.to_string();
+         let link = Text::literal(port_text.clone()).with_style(&Style {
+             color: Some(text::GREEN),
+diff --git a/crates/horizon-client/src/game/lan_screen.rs b/crates/horizon-client/src/game/lan_screen.rs
+index 055d1ea1f..08d384e30 100644
+--- a/crates/horizon-client/src/game/lan_screen.rs
++++ b/crates/horizon-client/src/game/lan_screen.rs
+@@ -1066,17 +1066,32 @@ impl Game<'_> {
+             server.call(move |g| g.apply_world_options(&b, &w));
+             if w.lan != b.lan || (w.lan && w.port != b.port) {
+                 match (w.lan, self.lan_port()) {
+-                    (true, Some(port)) => self.system_message(Text::translate(
+-                        "menu.multiplayerOptions.publish.started.lan",
+-                        &[Text::literal(port.to_string())],
+-                    )),
++                    (true, Some(port)) => {
++                        if b.lan {
++                            // The port moved under the shares: restart them
++                            // on the new one.
++                            self.friends_lan_closed();
++                        }
++                        self.system_message(Text::translate(
++                            "menu.multiplayerOptions.publish.started.lan",
++                            &[Text::literal(port.to_string())],
++                        ));
++                        // The server did the publishing here, not lan_open,
++                        // so the Steam and e4mc ports start from here too.
++                        self.friends_auto_publish();
++                    }
+                     (true, None) => {
+                         self.system_message(Text::translate("commands.publish.failed", &[]));
+                     }
+-                    (false, _) => self.system_message(Text::translate(
+-                        "menu.multiplayerOptions.publish.stopped",
+-                        &[],
+-                    )),
++                    (false, _) => {
++                        // The server unpublished by itself; the shares go
++                        // with the LAN port.
++                        self.friends_lan_closed();
++                        self.system_message(Text::translate(
++                            "menu.multiplayerOptions.publish.stopped",
++                            &[],
++                        ));
++                    }
+                 }
+             }
+             return;
+-- 
+2.55.0.windows.5
+
