@@ -30,6 +30,20 @@ cargo build --release -p horizon-client --features mods,steam
 `install.ps1` does the same, plus the build and the install into the
 launcher's game-mod folder, in one command.
 
+On Linux the same by hand, without the `steam` feature (the port's code is
+platform-free; the launcher names the binary `horizon-client` there):
+
+```sh
+git clone https://github.com/sambukuper/elyhorizon-launcher.git
+cd elyhorizon-launcher
+git am --3way /path/to/e4mc-minecraft-rust/horizon-integration/e4mc-port.patch
+cargo build --release -p horizon-client --features mods
+```
+
+`install.sh` does the same, plus the install into the launcher's game-mod
+folder (`~/.local/share/elyhorizon-launcher/game-mod`) and into every
+installed version, in one command.
+
 Once applied, `crates/horizon-e4mc` in the launcher is the source of truth;
 the standalone crate in this repository's `horizon-e4mc/` is the same code
 (`cargo test` works there on its own; the codec tests and the live relay

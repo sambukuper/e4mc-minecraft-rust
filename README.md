@@ -20,23 +20,56 @@ and puts it into the launcher, where every version, new ones included,
 plays it:
 
 ```powershell
+# Windows
 irm https://raw.githubusercontent.com/sambukuper/e4mc-minecraft-rust/main/install.ps1 | iex
 ```
+```sh
+# Linux
+curl -fsSL https://raw.githubusercontent.com/sambukuper/e4mc-minecraft-rust/main/install.sh | bash
+```
 
-The script finds (or clones)
+The scripts find (or clone)
 [sambukuper/elyhorizon-launcher](https://github.com/sambukuper/elyhorizon-launcher),
-applies the port as commits with `git am` (skipped when it is already in),
-builds `horizon-client` and installs the build as the launcher's game-mod
+apply the port as commits with `git am` (skipped when it is already in),
+build `horizon-client` and install the build as the launcher's game-mod
 build: the launcher swaps it into each version at launch and keeps each
-version's own binary as `horizon-client.exe.upstream`. Options:
-`-LauncherDir <path>` for an existing checkout, `-SkipBuild` to only
-integrate, `-NoGameMod` to build without installing.
+version's own binary as `horizon-client.exe.upstream` (on Linux,
+`horizon-client.upstream`). Options: `-LauncherDir <path>` /
+`--launcher-dir <path>` for an existing checkout, `-SkipBuild` /
+`--skip-build` to only integrate, `-NoGameMod` / `--no-game-mod` to build
+without installing. On Linux, `--with-launcher` also builds the launcher
+itself, and `--data-dir` picks the launcher's data folder.
 
-You need Windows x64, git, Rust 1.90+ ([rustup](https://rustup.rs)) and a
-copy of Minecraft: Java Edition 26.3 (the launcher prepares the game's
-resources from it). The `steam` feature is built in because the port ships
-beside the [e4steam port](https://github.com/sambukuper/e4steam-rust) in
-the same fork; e4mc itself needs no Steam.
+You need git, Rust 1.90+ ([rustup](https://rustup.rs)) and a copy of
+Minecraft: Java Edition 26.3 (the launcher prepares the game's resources
+from it), on Windows x64 or Linux x64. The `steam` feature is built in on
+Windows because the port ships beside the
+[e4steam port](https://github.com/sambukuper/e4steam-rust) in the same
+fork; e4mc itself needs no Steam, and the Linux install leaves Steam out
+entirely. The launcher is a GPUI program: building it on Linux needs its
+desktop packages, `libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev
+libfontconfig-dev libvulkan-dev libasound2-dev libudev-dev` on
+Debian/Ubuntu (`libxkbcommon-devel wayland-devel libxcb-devel
+fontconfig-devel vulkan-loader-devel alsa-lib-devel systemd-devel` on
+Fedora), or use the launcher release's own Linux build and let the script
+only install the game.
+
+## Linux
+
+The same flow with Linux paths and a Steam-free build:
+
+- The launcher's data folder is `~/.local/share/elyhorizon-launcher` (or
+  `$XDG_DATA_HOME/elyhorizon-launcher`; `HORIZON_LAUNCHER_HOME` and
+  `--data-dir` override it); the game's own data is `~/.local/share/horizon`.
+- The build is `cargo build --release -p horizon-client --features mods`:
+  no `steam`, so no Steamworks library, and `game-mod/` holds only the game
+  binary and `game-version.txt`.
+- Versions are the launcher's (`versions/v0.2.97/` with its `.installed`
+  marker); the script swaps the build into each and keeps the version's own
+  binary as `horizon-client.upstream`. A version of another Minecraft
+  version is left alone: the launcher would ignore the build there anyway.
+- To go back to vanilla: clear `~/.local/share/elyhorizon-launcher/game-mod`
+  and rename each `horizon-client.upstream` back to `horizon-client`.
 
 ## What carries over from the mod
 
@@ -65,7 +98,8 @@ world's address the normal way.
 | --- | --- |
 | `horizon-e4mc/` | The port as a standalone crate (`cargo test` works here on its own) |
 | `horizon-integration/e4mc-port.patch` | The port as commits, `git am`-able on the launcher |
-| `install.ps1` | The installer the one-liner above runs |
+| `install.ps1` | The Windows installer the one-liner above runs |
+| `install.sh` | The Linux installer: same flow, no Steam, `--with-launcher` builds the launcher too |
 | `upstream-e4mc/` | The original Java mod, for reference (its own MIT licence) |
 
 The launcher checkout stays the source of truth once installed: the patch
@@ -87,21 +121,50 @@ e4mc открывает одиночный мир Minecraft кому угодн�
 ```powershell
 irm https://raw.githubusercontent.com/sambukuper/e4mc-minecraft-rust/main/install.ps1 | iex
 ```
+```sh
+curl -fsSL https://raw.githubusercontent.com/sambukuper/e4mc-minecraft-rust/main/install.sh | bash
+```
 
 Скрипт находит (или клонирует)
 [sambukuper/elyhorizon-launcher](https://github.com/sambukuper/elyhorizon-launcher),
 накатывает порт коммитами через `git am` (пропускает, если он уже стоит),
 собирает `horizon-client` и ставит сборку как game-mod в лаунчер: лаунчер
 подменяет её в каждую версию при запуске, а родной exe версии сохраняет
-рядом как `horizon-client.exe.upstream`. Параметры: `-LauncherDir <путь>`
-для существующей копии, `-SkipBuild` только внедрить, `-NoGameMod` собрать
-без установки.
+рядом как `horizon-client.exe.upstream` (на Linux: `horizon-client.upstream`).
+Параметры: `-LauncherDir <путь>` / `--launcher-dir <путь>` для существующей
+копии, `-SkipBuild` / `--skip-build` только внедрить, `-NoGameMod` /
+`--no-game-mod` собрать без установки. На Linux `--with-launcher` собирает
+ещё и сам лаунчер, `--data-dir` задаёт папку данных лаунчера.
 
-Нужно: Windows x64, git, Rust 1.90+ ([rustup](https://rustup.rs)) и своя
-копия Minecraft: Java Edition 26.3 (лаунчер готовит из неё ресурсы игры).
-Фичя `steam` собрана потому, что порт стоит рядом со Steam-портом
+Нужно: git, Rust 1.90+ ([rustup](https://rustup.rs)) и своя копия
+Minecraft: Java Edition 26.3 (лаунчер готовит из неё ресурсы игры), на
+Windows x64 или Linux x64. Фича `steam` собрана только на Windows, потому
+что порт стоит рядом со Steam-портом
 ([e4steam-rust](https://github.com/sambukuper/e4steam-rust)) в том же
-форке; самому e4mc Steam не нужен.
+форке; самому e4mc Steam не нужен, и Linux-установка собирает без него.
+Лаунчер — программа на GPUI: сборка на Linux требует пакетов рабочего стола
+(`libxkbcommon-x11-dev libwayland-dev libx11-xcb-dev libfontconfig-dev
+libvulkan-dev libasound2-dev libudev-dev` в Debian/Ubuntu,
+`libxkbcommon-devel wayland-devel libxcb-devel fontconfig-devel
+vulkan-loader-devel alsa-lib-devel systemd-devel` в Fedora) — либо возьмите
+готовый Linux-релиз лаунчера, а скрипту оставьте только игру.
+
+### Linux
+
+Тот же поток, тот же результат; различаются пути и сборка:
+
+- Данные лаунчера: `~/.local/share/elyhorizon-launcher` (или
+  `$XDG_DATA_HOME/elyhorizon-launcher`; `HORIZON_LAUNCHER_HOME` и
+  `--data-dir` переопределяют), данные игры: `~/.local/share/horizon`.
+- Сборка: `cargo build --release -p horizon-client --features mods` — без
+  `steam`, поэтому ни Steamworks-библиотеки, ни лишних файлов: в `game-mod/`
+  только бинарь и `game-version.txt`.
+- Версии ставит лаунчер (`versions/v0.2.97/` с маркером `.installed`);
+  скрипт подменяет бинарь в каждой, а родной сохраняет как
+  `horizon-client.upstream`. Версия под другую версию Minecraft не
+  трогается: лаунчер её сборку всё равно бы проигнорировал.
+- Откат к ваниле: очистить `~/.local/share/elyhorizon-launcher/game-mod` и
+  вернуть каждый `horizon-client.upstream` на место `horizon-client`.
 
 Как в игре: откройте мир, Esc, «Открыть для сети»: мир сам публикуется, и
 в чате появляется адрес `mc.e4mc.link/xxxx`. Отдайте его другу, он вставит
