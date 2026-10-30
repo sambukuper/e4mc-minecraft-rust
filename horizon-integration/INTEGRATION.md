@@ -42,7 +42,14 @@ cargo build --release -p horizon-client --features mods
 
 `install.sh` does the same, plus the install into the launcher's game-mod
 folder (`~/.local/share/elyhorizon-launcher/game-mod`) and into every
-installed version, in one command.
+installed version, in one command. With `--download` it skips the clone,
+the patch and the build: it takes the prebuilt modded client from the
+fork's releases and installs that instead, so a player who already has the
+launcher needs only curl and tar.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/sambukuper/e4mc-minecraft-rust/main/install.sh | bash -s -- --download
+```
 
 Once applied, `crates/horizon-e4mc` in the launcher is the source of truth;
 the standalone crate in this repository's `horizon-e4mc/` is the same code
