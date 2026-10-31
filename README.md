@@ -201,12 +201,14 @@ vulkan-loader-devel alsa-lib-devel systemd-devel` в Fedora) — либо воз
 
 ## Credits and license
 
-- [e4mc](https://modrinth.com/project/qANg5Jrr) by vgskye and
-  contributors (MIT), the mod this port reimplements; the broker, the
-  protocol and the flow are its. The original source is kept in
-  `upstream-e4mc/` with its own licence.
+- This port is MIT ([LICENSE](LICENSE)). Its copyright lines carry both
+  sides: 2024 Skye, for [e4mc](https://modrinth.com/project/qANg5Jrr) (MIT),
+  the Java mod this port reimplements, and 2026 sambukuper, for the Rust
+  port itself. The broker, the protocol and the flow are e4mc's; the
+  original source is kept in `upstream-e4mc/` with its own licence.
 - [Horizon](https://github.com/horizon-rust/horizon): the game and the
-  launcher this integrates into; this repository's port code follows its
-  GPL-3.0-only licence ([LICENSE](LICENSE)).
+  launcher this integrates into, GPLv3. The integration patch touches
+  Horizon's sources, so a game built with the port stays GPLv3; the
+  standalone `horizon-e4mc` crate is the MIT part.
 - Not an official Minecraft product; not affiliated with Mojang or
   Microsoft.
